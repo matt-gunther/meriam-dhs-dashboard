@@ -1,0 +1,440 @@
+---
+title: "Untitled"
+author: "Matt Gunther"
+date: "5/10/2023"
+output: html_document
+---
+
+# User Inputs 
+
+Select all DHS countries you want to include in the app. 
+
+```{r}
+countries <- c("Ethiopia", "Kenya")
+```
+
+Choose a minimum year: all samples collected afterward will be included. 
+
+```{r}
+min_year <- 2000
+```
+
+Select DHS variables by IPUMS DHS name.
+
+```{r}
+vars <- c(
+  "AGE",
+  "BIRTHWT",
+  "BIRTHWTREF",
+  "BIDX",
+  "CASEID",
+  "CLUSTERNO",
+  "CLUSTERYEAR",
+  "COUNTRY",
+  "DIARRECENT",
+  "DRINKWTR",
+  "EDUCLVL",
+  "ELECTRC",
+  "FEVRECENT",
+  "FLOOR",
+  "HHID",
+  "INTYEAR",
+  "INTYEAR_ET",
+  "LIVELIHOOD",
+  "MONTHINT",
+  "MONTHINT_ET",
+  "KIDBIRTHMO",
+  "KIDBIRTHMO_ET",
+  "KIDBIRTHYR",
+  "KIDBIRTHYR_ET",
+  "KIDBORD",
+  "KIDSEX",
+  "KIDTWIN",
+  "KIDCURAGE",
+  "PERWEIGHT",
+  "RESIDEINTYR",
+  "SAMPLE",
+  "TOILETTYPE",
+  "URBAN",
+  "YEAR",
+  "HWWHZNCHS",
+  "HWWHZWHO"
+)
+```
+
+================================================================================
+
+# Pull data from source 
+
+```{r}
+source("utils.r")
+library(ipumsr)
+library(rlang)
+
+# Set up Conda environment (for use of Ethiopia calendar converter Python lib)
+if(!dir_exists("/pkg")){
+  rlang::abort(c(
+    "The folder `/pkg` was not found. IPUMS DHS data is not accessable.",
+    i = "This script is intended for use at <https://rstudio.pop.umn.edu/>"
+  ))
+} else {
+  
+  if(!dir.exists(here("meriam_conda"))){conda_create("./meriam_conda")}
+  use_condaenv("meriam_conda")
+  
+  if(!py_module_available("ethiopian_date")){
+    conda_install(
+      envname = "./meriam_conda",
+      packages = "ethiopian_date", 
+      pip = TRUE
+    )
+  }
+  
+  if(!py_module_available("ipums.metadata")){
+    conda_install(
+      envname = "./meriam_conda",
+      packages = "ipums-metadata",
+      channel = "/pkg/ipums/programming/conda/mpc/"
+    )
+    py_install("pandas==1.4", pip = TRUE)
+  }
+}
+
+im <- reticulate::import("ipums.metadata")
+dhs_samps <- im$Samples("dhs")$ws %>% tibble()
+
+# Find relevant child samples 
+my_samps <- dhs_samps %>% 
+  filter(COUNTRYNAME %in% countries, YEAR >= min_year, UNIT == "children") %>% 
+  pull(SAMPLE)
+
+inform(c("Will get IPUMS data for:", my_samps))
+
+# Append sample-specific geo variables to `vars`
+vars <- my_samps %>% 
+  str_remove_all("[0-9]*kr") %>% 
+  unique() %>% 
+  toupper() %>% 
+  paste0("DHS_IPUMSI_", .) %>% 
+  c(vars, .)
+
+# List all data files in IPUMS DHS staging area 
+dat <- my_samps %>%
+  set_names() %>% 
+  map(function(samp){
+    dat_file <- im$project_config("dhs")$path %>%
+      file.path("output_data/current", paste0(samp, "_dhs.dat.gz"))
+    
+    yml_file <- im$project_config("dhs")$path %>%
+      file.path("output_data/current/syntax", paste0(samp, "_dhs.yml"))
+    
+    yml <- readr::read_lines(yml_file)
+    
+    yml <- suppressWarnings(yml %>% stringr::str_conv(encoding = "ASCII")) %>%
+      yaml::yaml.load()
+    
+    var_info <- yml$variables %>% 
+      keep(~.x$name %in% vars) %>% 
+      map(.progress = TRUE, ~{
+        
+        vals <- .x$values %>% map_df(~.x)
+        if(nrow(vals) == 0){
+          vals <- tibble(val = integer(), lbl = character())
+        } else {
+          vals <- vals %>% mutate(val = value, lbl = label)
+        }
+        
+        output <- tibble(
+          var_name = .x$name, 
+          var_label = .x$label,
+          var_desc = "",
+          val_labels = list(vals),
+          code_instr = NA_character_,
+          start = .x$start_column,
+          end = start + .x$width - 1,
+          imp_decim = .x$implied_decimals,
+          var_type = case_when(
+            .x$is_string_var ~ "character",
+            .x$is_double_var ~ "double",
+            .default = "integer"
+          ),
+          rectypes = .x$record_type,
+          var_type_svar = "character"
+        )
+      }) %>% 
+      list_rbind()
+    
+    ddi <- ipumsr::make_ddi_from_scratch(
+      file_name = basename(dat_file),
+      file_path = dirname(dat_file),
+      file_type = "rectangular",
+      ipums_project = "internal",
+      rectypes = NULL,
+      rectype_idvar = NA_character_,
+      var_info = var_info,
+      conditions = "Internal IPUMS Input Data"
+    )
+    
+    col_spec <- ipumsr:::ddi_to_colspec(ddi, "long")
+    
+    output <- hipread::hipread_long(
+      file = dat_file,
+      var_info = col_spec,
+      rt_info =  ipumsr:::ddi_to_rtinfo(ddi),
+      n_max = Inf,
+      encoding = NULL
+    )
+    
+    output <- ipumsr:::set_ipums_var_attributes(output, ddi)
+    inform(paste(samp, "complete!"))
+    output
+  }) 
+```
+
+# Dates 
+
+Date variables from Ethiopian samples need to be converted to the Gregorian calendar. This includes the child's DOB and the interview date. 
+
+The Ethiopian calendar consists of 12 months of 30 days each, then 1 short month that is 5-6 days depending on leap-year. DHS collapses the 12th and 13th month, effectively creating a single 35 or 36 day month.
+
+We cannot easily convert Ethiopian dates to Gregorian dates because the 1st day of a Gregorian month usually falls somewhere in the middle of an Ethiopian month. The overlap is about 1 week, so for example: the 9th Ethiopian month "Ginbot" includes 3 weeks of May and 1 week of June. You'd expect 75% of Ginbot children to be born in May, and about 25% to be born in June. 
+
+Andrew selected the 15th as the mean day of each Gregorian month. I'm going to choose the 22nd day of the Ethiopian month, resulting in the closest possible approximation to this 75%, 25% rule (in case it is important for CMCs or classification in monthly indicators tied to the Gregorian calendar). 
+
+```{r}
+et_dates <- reticulate::import("ethiopian_date")$EthiopianDateConverter
+
+# Make `KIDBIRTH` and `INTERVIEW`
+dat <- dat %>% 
+  map(.progress = "Making all dates Gregorian", ~{
+    if(unique(.x$COUNTRY) == 231){
+      .x$KIDBIRTH <- make_date(.x$KIDBIRTHYR_ET, .x$KIDBIRTHMO_ET) %>% 
+        map(et_dates$date_to_gregorian) %>% 
+        list_c() 
+      .x$INTERVIEW <- make_date(.x$INTYEAR_ET, .x$MONTHINT_ET) %>% 
+        map(et_dates$date_to_gregorian) %>% 
+        list_c() 
+    } else {
+      .x$KIDBIRTH <- make_date(.x$KIDBIRTHYR, .x$KIDBIRTHMO, 15)
+      .x$INTERVIEW <- make_date(.x$INTYEAR, .x$MONTHINT, 15)
+    }
+    return(.x)
+  })
+```
+
+# Selection and formatting of final variables 
+
+Some variables are not included in all samples. For example: et2019_kr excludes variables related to the child's birth weight and whether they recently had a fever or diarrhea. 
+
+In such cases, we don't want to exclude an entire sample simply because a few controls are unavailable. Instead, we'll omit the control in that particular case. 
+
+To do this, we'll use the `utils.r` function I call `force_make`, which returns a placeholder column with `NA` values if a variable can't be created as designed. (This prevents the function from returning a fatal error, and it ensures that all samples have the same columns.)
+
+```{r}
+dat <- dat %>% 
+  imap(
+    ~.x %>% 
+      rename_with(
+        ~.x %>% str_replace("DHS_IPUMSI_.*", "GEO"), 
+        starts_with("DHS_IPUMSI")
+      ) %>% 
+      mutate(
+        .keep = "none",
+        whz = case_when(HWWHZWHO < 9000 ~ HWWHZWHO / 100) %>% force_make,
+        birthwt = as.double(BIRTHWT) %>% force_make,
+        birthwt_card = force_make(BIRTHWTREF == 1),
+        birth_order = as.double(KIDBORD) %>% force_make, 
+        birth_index = as.double(BIDX) %>% force_make,
+        birth_date = KIDBIRTH %>% force_make,
+        kid_male = force_make(KIDSEX == 1),
+        kid_alive = force_make(KIDCURAGE != 99), 
+        kid_agemo = interval(KIDBIRTH, INTERVIEW) %/% months(1) %>% force_make,
+        kid_diar = case_when(DIARRECENT < 90 ~ DIARRECENT >= 20) %>% force_make,
+        kid_fevr = case_when(FEVRECENT < 90 ~ FEVRECENT >= 20) %>% force_make,
+        mom_age = as.double(AGE) %>% force_make,
+        mom_edu = EDUCLVL %>% 
+          case_match(0 ~ "None", 1 ~ "Primary", 2:3 ~ "Secondary+") %>% 
+          force_make, 
+        mom_id = force_make(CASEID),
+        hh_urban = force_make(URBAN == 1), 
+        hh_electric = case_when(ELECTRC <= 1 ~ ELECTRC == 1) %>% force_make,
+        hh_toilet = TOILETTYPE %>% 
+          case_match(0 ~"None", 1:1999 ~ "Flush", 2000:9000 ~ "Non-flush") %>% 
+          force_make, 
+        hh_drink = DRINKWTR %>% 
+          case_match(
+            1000:1999 ~ "Piped", 2000:2999 ~ "Well", 3000:4999 ~ "Surface",
+            5000:6000 ~ "Other") %>% 
+          force_make, 
+        hh_natfloor = case_when(FLOOR <= 400 ~ FLOOR < 200) %>% force_make,
+        hh_id = as.character(HHID) %>% force_make,
+        int_date = INTERVIEW %>% force_make, 
+        weight = as.double(PERWEIGHT) %>% force_make,
+        cluster = as.double(CLUSTERNO) %>% force_make,
+        geo = GEO %>% as_factor %>% as.character %>% force_make,
+        lz = LIVELIHOOD %>% force_make,
+        sample = SAMPLE %>% as.double %>% force_make,
+        country = COUNTRY %>% as_factor %>% as.character, 
+        country_code = COUNTRY %>% as.double %>% force_make,
+        iso = .y %>% str_remove("2.*") %>% toupper,
+        sample_yr = YEAR %>% as.integer
+      )
+  ) 
+```
+
+# Adjust Livelihood Zones 
+
+In Ethiopia, the column `LZTYPE` lines up nicely with what Andrew published in the paper. We only need to collapse "Cropping - Belg Dominant" (short season) with "Cropping - Meher Dominant" (main season) into "Agricultural". There are 4 multipolygons that have no `LZTYPE` (NA); the column `LZNAMEEN` shows that these were not zoned. 
+
+In Kenya, the column `LZTYPE` is blank, so we'll have to make some descisions with the labels that are available.   
+
+```{r}
+# Download the file to a temporary folder 
+"https://s3.amazonaws.com/shapefiles.fews.net/LHZ/FEWS_NET_LH_World.zip" %>% 
+  download.file(path_temp("fews.RData.zip"))
+
+# Unzip the file 
+unzip(
+  path_temp("fews.RData.zip"),
+  exdir = path_temp("fews")
+)
+
+# Read and save 
+lz <- path_temp("fews") %>% read_sf() %>% tibble()
+
+dat <- dat %>% 
+  imap(~{
+    iso <- unique(.x$iso)
+    
+    .x <- .x %>%
+      mutate(
+        lznum = lz %>% 
+          as.character %>% 
+          str_remove(country %>% as.character) %>%
+          as.double,
+        lz = lz %>% as_factor %>% as.character
+      )
+    
+    .x <- lz %>%
+      filter(COUNTRY == iso) %>%
+      select(lznum = LZNUM, lztype = LZTYPE) %>%
+      right_join(.x, by = "lznum", multiple = "all")
+
+    .x %>% 
+      mutate(
+        lz = case_when(
+          hh_urban ~ "Urban",
+          str_detect(lztype, "Cropping") ~ "Agricultural",
+          !is.na(lztype) ~ lztype,
+          lz %>% str_detect("Riverine|Fishing|Coastal Medium") ~ "Fishing",
+          lz %>% str_detect("Agropastoral|Mixed") ~ "Agropastoral",
+          lz %>% str_detect("Pastoral") ~ "Pastoral",
+          lz %>% str_detect("Farming|Potential") ~ "Agricultural",
+          .default = "Rural (undefined)"
+        )
+      ) %>% 
+      select(-c(lztype, lznum))
+    
+  })
+```
+
+# GPS 
+
+This is a particularly brittle solution. 
+
+It only works because Finn happened to get the DHS GPS files for the countries we initially picked for the dashboard, but I will ultimately have to get DHS permissions and download new ones. 
+
+```{r}
+# Ethiopia 
+mpctools::mpc_root(
+  path(
+    "personal/finn/nasa/projects/nasa_dhs/data/dhs/",
+    "et/dhs_clust_point_et.geojson"
+  )) %>%
+  file_copy(here("data/gps/et.geojson"))
+
+# Kenya
+mpctools::mpc_root(
+  path(
+    "personal/finn/nasa/projects/nasa_dhs/data/dhs/",
+    "ke/dhs_clust_point_ke.geojson"
+  )) %>%
+  file_copy(here("data/gps/ke.geojson"))
+
+dat <- dat %>% 
+  imap(~{
+    yr <- .y %>% parse_number()
+    file <- .y %>% 
+      str_remove(yr %>% as.character) %>% 
+      str_remove("kr") %>% 
+      paste0(".geojson")
+    gps <- here("data/gps", file) %>% read_sf() 
+    epsg <- gps %>% crsuggest::suggest_top_crs(units = "m")
+    gps %>%
+      filter(abs(DHSYEAR - yr) <= 1) %>%
+      select(cluster = DHSCLUST, geometry) %>%
+      right_join(.x, by = "cluster", multiple = "all") %>%
+      tibble() %>% 
+      mutate(epsg = epsg)
+  })
+```
+
+# Write Output  
+
+I'm making a hierarchical file so that sample-level details are easier to access. The data, itself, is nested in the column `data`. The column `data_dictionary` has labels for each variable.
+ 
+```{r}
+dd <- tibble(var_name = names(dat[[1]])) %>% 
+  mutate(label = var_name %>% case_match(
+    "cluster" ~ "cluster id",     
+    "geometry" ~ "cluster centroid",    
+    "whz" ~ "whz",         
+    "birthwt" ~ "child birth weight",     
+    "birthwt_card" ~ "child birth weight recorded on card",
+    "birth_order" ~ "child place in birth order", 
+    "birth_index" ~ "child place in birth index", 
+    "birth_date" ~ "child birth date",  
+    "kid_male" ~ "child is male",    
+    "kid_alive" ~ "child is alive",   
+    "kid_agemo" ~ "child age in months",   
+    "kid_diar" ~ "child recent diarrhea",    
+    "kid_fevr" ~ "child recent fever",    
+    "mom_age" ~ "mom age in years",     
+    "mom_edu" ~ "mom education",     
+    "mom_id" ~ "mom id",      
+    "hh_urban" ~ "household is in urban area",    
+    "hh_electric" ~ "household has electricity", 
+    "hh_toilet" ~ "household toilet type",   
+    "hh_drink" ~ "household drinking water type",    
+    "hh_natfloor" ~ "household has a floor made of natural materials", 
+    "hh_id" ~ "household id",       
+    "int_date" ~ "interview date",    
+    "weight" ~ "survey weight",      
+    "geo" ~ "region (or equivalent)",         
+    "lz" ~ "livelihood zone",          
+    "sample" ~ "sample",      
+    "country" ~ "country label",     
+    "country_code" ~ "country code",
+    "iso" ~ "iso label",         
+    "sample_yr" ~ "sample year" 
+  )) 
+
+dat %>% 
+  map_dfr(
+    ~.x %>%
+      summarise(
+        across(c(sample, country, sample_yr, country_code, iso), unique),
+        first_interview = min(int_date), 
+        last_interview = max(int_date),
+        min_date = floor_date(first_interview, "year") - years(2),
+        max_date = floor_date(last_interview, "year") + years(2),
+        has_gps = n_distinct(geometry) > 1,
+        epsg = unique(epsg),
+        data_dictionary = list(dd), 
+        data = list(.x)
+      )
+  ) %>%  
+  write_rds(here("data", "ipums_dhs.rds"), compress = "gz")
+  
+```
+

@@ -1,0 +1,60 @@
+.section.level1, .section.level2, .section.level3, section.level1, section.level2, section.level3 {
+    margin-top: 0rem;
+}
+
+a {
+  text-decoration: none;
+  display: inline-block;
+}
+
+.value-box i {
+  float: right;
+  font-size: 0.4em;
+}
+
+.value-box .caption {
+    color:  rgba(0, 0, 0, 0.7);;
+}
+
+.modal-content .col-sm-6 {
+  width: 25%;
+}
+
+.modal-content tfoot {
+  display: none;
+}
+
+.modal-content .dataTables_wrapper {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 20%;
+}
+
+.modal-content .dataTables_paginate .pagination{
+  display: flex;
+  gap: 30px;
+}
+
+.modal-content .form-control {
+  max-width: 150px;
+}
+
+.value-box {
+  border-radius: 0.375rem !important;
+}
+
+.navbar-brand {
+  white-space: normal;
+}
+
+.shiny-input-container {
+  width: unset !important;
+  max-width: 100% !important;
+}
+
+@media (max-width: 575.98px) {
+  .navbar-header {
+    width:100%;
+    display: inline-flex !important;
+  }
+}
