@@ -59,3 +59,4 @@ make_vb_icon <- function(input, label){
     style = "color: rgba(0, 0, 0, 0.7);"
   )
 }
+
